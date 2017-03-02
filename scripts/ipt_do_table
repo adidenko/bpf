@@ -23,7 +23,6 @@ bpf_text = """
 #include <linux/netfilter.h>
 #include <linux/netfilter/x_tables.h>
 #include <linux/netdevice.h>
-#include <linux/netdevice.h>
 
 typedef struct {
         u64 ts;
