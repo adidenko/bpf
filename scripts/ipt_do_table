@@ -1,0 +1,150 @@
+#!/usr/bin/python
+#
+# Trace ipt_do_table() kernel function
+#
+# optional arguments:
+#   -T, --timestamp    include timestamp on output
+#   -R, --rawretval    do not try conver return value into human readable format
+#   -p PID, --pid PID  trace this PID only
+#
+# Licensed under the Apache License, Version 2.0
+# Copyright (C) 2017 Alex Didenko
+
+from __future__ import print_function
+from bcc import BPF
+from time import strftime
+import argparse
+import ctypes as ct
+
+# BPF program
+bpf_text = """
+#include <linux/ptrace.h>
+#include <linux/sched.h>        /* For TASK_COMM_LEN */
+#include <linux/netfilter.h>
+#include <linux/netfilter/x_tables.h>
+#include <linux/netdevice.h>
+#include <linux/netdevice.h>
+
+typedef struct {
+        u64 ts;
+        u64 pid;
+        unsigned int ret;
+        char comm[TASK_COMM_LEN];
+        char dev[80];
+        char table[80];
+} data_t;
+
+BPF_PERF_OUTPUT(events);
+BPF_HASH(iptcall, u64, data_t);
+
+int kprobe__ipt_do_table(struct pt_regs *ctx, struct sk_buff *skb, const struct nf_hook_state *state, struct xt_table *table)
+{
+    u64 pid = bpf_get_current_pid_tgid();
+    u32 __tgid = pid >> 32;
+    u32 __pid = pid;
+
+    FILTER
+
+    data_t data = {};
+    data.ts = bpf_ktime_get_ns();
+    data.pid = __pid;
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+    if (skb->dev != 0) {
+        bpf_probe_read(&data.dev, sizeof(data.dev), (void *)skb->dev->name);
+    }
+
+    if (table != 0) {
+        bpf_probe_read(&data.table, sizeof(data.table), (void *)table->name);
+    }
+
+    iptcall.update(&pid, &data);
+    return 0;
+};
+
+int kretprobe__ipt_do_table(struct pt_regs *ctx)
+{
+    unsigned int ret = PT_REGS_RC(ctx);
+    u64 pid = bpf_get_current_pid_tgid();
+
+    data_t *datap = iptcall.lookup(&pid);
+
+    if (datap == 0) {
+        return 0;
+    }
+    data_t data = *datap;
+    data.ret = ret;
+    events.perf_submit(ctx, &data, sizeof(data));
+    iptcall.delete(&pid);
+    return 0;
+};
+"""
+
+# Arguments
+parser = argparse.ArgumentParser(
+    description="Trace ipt_do_table() kernel function",
+    formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument("-T", "--timestamp", action="store_true",
+    help="include timestamp on output")
+parser.add_argument("-R", "--rawretval", action="store_true",
+    help="do not try conver return value into human readable format")
+parser.add_argument("-p", "--pid",
+    help="trace this PID only")
+args = parser.parse_args()
+
+# Add filter
+if args.pid:
+    bpf_text = bpf_text.replace('FILTER',
+        'if (__pid != %s) { return 0; }' % args.pid)
+else:
+    bpf_text = bpf_text.replace('FILTER', '')
+
+# Initialize BPF
+b = BPF(text=bpf_text)
+
+# Event data
+TASK_COMM_LEN = 16  # linux/sched.h
+class Data(ct.Structure):
+    _fields_ = [
+        ("ts", ct.c_ulonglong),
+        ("pid", ct.c_ulong),
+        ("ret", ct.c_uint),
+        ("comm", ct.c_char * TASK_COMM_LEN),
+        ("dev", ct.c_char * 80),
+        ("table", ct.c_char * 80),
+    ]
+
+# Readable result dict
+ret_hash = {
+'0': 'NF_DROP',
+'1': 'NF_ACCEPT',
+'2': 'NF_STOLEN',
+'3': 'NF_QUEUE',
+'4': 'NF_REPEAT',
+'5': 'NF_STOP'
+}
+
+# Header
+print("Tracing ipt_do_table()... Hit Ctrl-C to end.")
+if args.timestamp:
+  print("%-12s" % "TIME", end="")
+print("%-6s %-16s %-20s %-10s %-10s" % ("PID", "COMM", "DEV", "TABLE",
+       "RETVAL"))
+
+# Process event
+def print_event(cpu, data, size):
+    event = ct.cast(data, ct.POINTER(Data)).contents
+    time = strftime("%H:%M:%S")
+    if args.timestamp:
+      print("%-12s" % time[:8], end="")
+    print("%-6d %-16s %-20s %-10s" % (event.pid, event.comm,
+           event.dev, event.table), end="")
+    if args.rawretval:
+      print("%-10s" % event.ret)
+    else:
+      print("%-10s" % ret_hash.get("%s" % event.ret, 'UNKNOWN_RESULT'))
+
+# Read events
+b["events"].open_perf_buffer(print_event)
+while 1:
+    b.kprobe_poll()
