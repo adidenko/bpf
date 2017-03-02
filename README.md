@@ -17,3 +17,6 @@ sudo apt-get install bcc-tools
 ## Usefull links
 
 * https://github.com/iovisor/bcc/
+
+## Scripts
+* scripts/[ipt_do_table](scripts/ipt_do_table) - trace `ipt_do_table()` kernel function, prints some function args and result.
